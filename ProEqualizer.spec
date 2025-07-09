@@ -9,11 +9,10 @@ datas_to_include = [
     ('music', 'music'),                   # Müzik dosyalarını ekle
     ('ffmpeg/windows', 'ffmpeg/windows'), # Windows için FFmpeg
     ('ffmpeg/macos', 'ffmpeg/macos'),     # macOS için FFmpeg (platformlar arası uyumluluk için)
-    ('ffmpeg/linux', 'ffmpeg/linux')      # Linux için FFmpeg (platformlar arası uyumluluk için)
 ]
 
 a = Analysis(
-    ['equalizer_app.py'],  # ANA PYTHON DOSYANIZIN ADI
+    ['main.py'],  # ANA PYTHON DOSYANIZIN ADI
     pathex=['.'],          # Proje kök dizini
     binaries=[],
     datas=datas_to_include,

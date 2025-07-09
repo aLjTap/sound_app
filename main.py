@@ -96,18 +96,12 @@ def resource_path(relative_path):
 
 # =============================================================================
 # --- Pydub için FFmpeg yolunu ayarla ---
-# =============================================================================
-# Bu satır, pydub'ın paketlenmiş uygulamadaki ffmpeg.exe'yi bulmasını sağlar.
-# Detect operating system and set appropriate ffmpeg binary
 if platform.system() == "Windows":
     AudioSegment.converter = resource_path("ffmpeg/windows/ffmpeg")
 elif platform.system() == "Darwin":  # macOS
     AudioSegment.converter = resource_path("ffmpeg/macos/ffmpeg")
-else:  # Linux and other Unix-like systems
+else:
     AudioSegment.converter = resource_path("ffmpeg/ffmpeg")
-# Bazen ffprobe da gerekebilir, garanti olsun diye ekleyelim.
-# AudioSegment.ffprobe = resource_path("ffmpeg/ffprobe.exe") # Genellikle converter'ı ayarlamak yeterlidir.
-
 
 def _format_duration(seconds: float) -> str:
     mins, secs = divmod(seconds, 60)
