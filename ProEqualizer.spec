@@ -20,7 +20,8 @@ a = Analysis(
         # PyInstaller'ın gözden kaçırabileceği önemli modülleri ekliyoruz.
         'pydub.utils',
         'mutagen',
-        'platform'
+        'platform',
+        'numba'
     ],
     hookspath=[],
     runtime_hooks=[],

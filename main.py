@@ -2,6 +2,8 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 import customtkinter as ctk
 import numpy as np
+import pyfftw
+fft_module = pyfftw.interfaces.numpy_fft
 import pyaudio
 import threading
 import time
@@ -130,26 +132,43 @@ def design_peaking_filter(center_freq, q_factor, gain_db, fs):
     return {"b": b, "a": a}
 
 
-def apply_biquad_filter(data, filter_coeffs, zi=None):
-    """Biquad filtre uygular"""
-    if zi is None:
-        zi = np.zeros(2)
 
-    b = filter_coeffs["b"]
-    a = filter_coeffs["a"]
+# --- Numba ile hızlandırılmış zincirleme filtre uygulaması ---
+try:
+    from numba import njit
+    NUMBA_AVAILABLE = True
+except ImportError:
+    NUMBA_AVAILABLE = False
 
-    output = np.zeros_like(data)
-
-    for i in range(len(data)):
-        # Direct Form II implementation
-        w = data[i] - a[1] * zi[0] - a[2] * zi[1]
-        output[i] = b[0] * w + b[1] * zi[0] + b[2] * zi[1]
-
-        # Update delay line
-        zi[1] = zi[0]
-        zi[0] = w
-
-    return output, zi
+if NUMBA_AVAILABLE:
+    @njit(cache=True)
+    def chain_biquad_filters(data, filters_b, filters_a, filters_zi, num_filters):
+        out = data.copy()
+        for f in range(num_filters):
+            b = filters_b[f]
+            a = filters_a[f]
+            z = filters_zi[f]
+            z0, z1 = z[0], z[1]
+            for n in range(len(out)):
+                w = out[n] - a[1] * z0 - a[2] * z1
+                out[n] = b[0] * w + b[1] * z0 + b[2] * z1
+                z1, z0 = z0, w
+            filters_zi[f, 0], filters_zi[f, 1] = z0, z1
+        return out, filters_zi
+else:
+    def chain_biquad_filters(data, filters_b, filters_a, filters_zi, num_filters):
+        out = data.copy()
+        for f in range(num_filters):
+            b = filters_b[f]
+            a = filters_a[f]
+            z = filters_zi[f]
+            z0, z1 = z[0], z[1]
+            for n in range(len(out)):
+                w = out[n] - a[1] * z0 - a[2] * z1
+                out[n] = b[0] * w + b[1] * z0 + b[2] * z1
+                z1, z0 = z0, w
+            filters_zi[f, 0], filters_zi[f, 1] = z0, z1
+        return out, filters_zi
 
 
 class AudioEngine:
@@ -164,10 +183,7 @@ class AudioEngine:
         self.is_paused = False
         self.current_frame = 0
         self.playback_thread: Optional[threading.Thread] = None
-
-        # --- DEĞİŞİKLİK 1: Kilitleri ayırın ---
-        self.playback_lock = threading.Lock()  # Sadece çalma pozisyonu için
-        self.eq_lock = threading.Lock()  # Sadece EQ ayarları için YENİ KİLİT
+        self.playback_lock = threading.Lock()
 
         self.filters: List[Optional[Dict]] = [None] * len(FREQ_BANDS)
         self.filter_states: List[Optional[np.ndarray]] = [None] * len(FREQ_BANDS)
@@ -175,23 +191,42 @@ class AudioEngine:
         self.ui_visualizer_callback = on_visualization_update
         self.ui_stop_callback = on_playback_stopped
 
-    # ... (load_song, play, stop, toggle_pause, seek, seek_to_frame metodları aynı kalıyor) ...
-
     def update_eq(self, gains_db: List[float], q_factor: float):
+        """
+        Optimize: Sadece değişen filtrelerin katsayılarını ve state'lerini güncelle.
+        Aynı kalan filtrelerin state'ini koru, gereksiz yere sıfırlama yapma.
+        """
         if not self.song:
             return
-        # --- DEĞİŞİKLİK 2: Doğru kilidi kullanın ---
-        with self.eq_lock:  # playback_lock yerine eq_lock kullanılıyor
+        with self.playback_lock:
             for i, gain in enumerate(gains_db):
+                prev_filter = self.filters[i]
+                prev_gain = None
+                prev_q = None
+                if prev_filter is not None:
+                    # Eski gain ve q değerlerini çözümle (katsayıdan çıkarılamaz, ama optimize için not)
+                    pass
                 if abs(gain) < 0.1:
-                    self.filters[i], self.filter_states[i] = None, None
+                    # Kapalıysa filtreyi ve state'i kaldır
+                    if self.filters[i] is not None or self.filter_states[i] is not None:
+                        self.filters[i], self.filter_states[i] = None, None
                 else:
-                    self.filters[i] = design_peaking_filter(
+                    # Yeni katsayıyı oluştur
+                    new_filter = design_peaking_filter(
                         FREQ_BANDS[i], q_factor, gain, self.song.frame_rate
                     )
-                    if self.filter_states[i] is None and self.song:
-                        # Initialize filter state for each channel
+                    # Eğer filtre katsayıları değişmediyse state'i koru
+                    if (
+                        self.filters[i] is not None
+                        and np.allclose(self.filters[i]["b"], new_filter["b"], atol=1e-6)
+                        and np.allclose(self.filters[i]["a"], new_filter["a"], atol=1e-6)
+                    ):
+                        # Aynı filtre, state'i koru
+                        pass
+                    else:
+                        # Farklıysa state'i sıfırla
                         self.filter_states[i] = np.zeros((self.song.channels, 2))
+                    self.filters[i] = new_filter
 
     def _playback_loop(self):
         if not self.song or self.audio_data is None:
@@ -208,16 +243,12 @@ class AudioEngine:
                 time.sleep(0.1)
             if not self.is_playing:
                 break
-            # Bu kilit sadece current_frame'i koruyor, bu yüzden çok hızlı.
             with self.playback_lock:
                 start, end = self.current_frame, self.current_frame + CHUNK_SIZE
                 if end > len(self.audio_data):
                     break
                 chunk, self.current_frame = self.audio_data[start:end], end
-
-            # Filtreleme artık kendi kilidini kullanıyor ve çalma akışını bozmuyor.
             processed_chunk = self._apply_filters(chunk)
-
             self.stream.write(processed_chunk.tobytes())
             self.ui_progress_callback(self.current_frame, self.song.duration_seconds)
             self.ui_visualizer_callback(
@@ -227,32 +258,40 @@ class AudioEngine:
         self.ui_stop_callback()
 
     def _apply_filters(self, chunk: np.ndarray) -> np.ndarray:
+        """
+        Optimize: Apply all active filters in a single loop (Numba/NumPy),
+        process both channels together if stereo, minimize Python overhead.
+        """
         processed_chunk = chunk.copy()
-        # --- DEĞİŞİKLİK 3: Doğru kilidi kullanın ---
-        with self.eq_lock:  # playback_lock yerine eq_lock kullanılıyor
-            for i, filter_coeffs in enumerate(self.filters):
-                if filter_coeffs is not None and self.filter_states[i] is not None:
-                    if processed_chunk.ndim == 2:
-                        # Stereo - process each channel separately
-                        processed_chunk[:, 0], self.filter_states[i][0] = (
-                            apply_biquad_filter(
-                                processed_chunk[:, 0],
-                                filter_coeffs,
-                                zi=self.filter_states[i][0],
-                            )
-                        )
-                        processed_chunk[:, 1], self.filter_states[i][1] = (
-                            apply_biquad_filter(
-                                processed_chunk[:, 1],
-                                filter_coeffs,
-                                zi=self.filter_states[i][1],
-                            )
-                        )
-                    else:
-                        # Mono
-                        processed_chunk, self.filter_states[i][0] = apply_biquad_filter(
-                            processed_chunk, filter_coeffs, zi=self.filter_states[i][0]
-                        )
+        with self.playback_lock:
+            # Aktif filtrelerin indekslerini topla
+            active_idx = [i for i, f in enumerate(self.filters) if f is not None and self.filter_states[i] is not None]
+            if not active_idx:
+                return np.clip(processed_chunk, -1.0, 1.0)
+
+            num_filters = len(active_idx)
+            # Mono
+            if processed_chunk.ndim == 1:
+                filters_b = np.stack([self.filters[i]["b"] for i in active_idx])
+                filters_a = np.stack([self.filters[i]["a"] for i in active_idx])
+                filters_zi = np.stack([self.filter_states[i][0] for i in active_idx])
+                out, new_zi = chain_biquad_filters(processed_chunk, filters_b, filters_a, filters_zi, num_filters)
+                processed_chunk = out
+                for idx, i in enumerate(active_idx):
+                    self.filter_states[i][0] = new_zi[idx]
+            # Stereo
+            elif processed_chunk.ndim == 2 and processed_chunk.shape[1] == 2:
+                for ch in range(2):
+                    filters_b = np.stack([self.filters[i]["b"] for i in active_idx])
+                    filters_a = np.stack([self.filters[i]["a"] for i in active_idx])
+                    filters_zi = np.stack([self.filter_states[i][ch] for i in active_idx])
+                    out, new_zi = chain_biquad_filters(processed_chunk[:, ch], filters_b, filters_a, filters_zi, num_filters)
+                    processed_chunk[:, ch] = out
+                    for idx, i in enumerate(active_idx):
+                        self.filter_states[i][ch] = new_zi[idx]
+            else:
+                # Unexpected shape, fallback
+                pass
         return np.clip(processed_chunk, -1.0, 1.0)
 
     def load_song(self, filepath: str) -> bool:
@@ -323,7 +362,6 @@ class AudioEngine:
                         FREQ_BANDS[i], q_factor, gain, self.song.frame_rate
                     )
                     if self.filter_states[i] is None and self.song:
-                        # Initialize filter state for each channel
                         self.filter_states[i] = np.zeros((self.song.channels, 2))
 
     def _initialize_filter_states(self):
@@ -617,16 +655,19 @@ class RealtimeEqualizer(ctk.CTk):
     def update_visualization(self, samples: np.ndarray):
         if not self.audio_engine.is_playing or len(samples) < 1:
             return
-        magnitudes = 20 * np.log10(
-            np.abs(np.fft.rfft(samples * np.hanning(len(samples)))) + 1e-9
-        )
+        # FFT işlemi: pyfftw ile hızlı, mono/stereo ayrımı
+        if samples.ndim > 1:
+            # Stereo ise sadece sol kanalı göster
+            samples = samples[:, 0]
+        windowed = samples * np.hanning(len(samples))
+        fft_result = pyfftw.interfaces.numpy_fft.rfft(windowed)
+        magnitudes = 20 * np.log10(np.abs(fft_result) + 1e-9)
         canvas_height = self.vis_canvas.winfo_height()
         if canvas_height <= 1:
             canvas_height = 180
         num_fft_bins, log_indices = len(magnitudes), np.logspace(
             0, np.log10(len(magnitudes) - 1), NUM_VIS_BARS + 1, dtype=int
         )
-
         for i in range(NUM_VIS_BARS):
             start_idx, end_idx = log_indices[i], log_indices[i + 1]
             bar_magnitude = (
