@@ -8,7 +8,6 @@ import time
 import os
 import glob
 from pydub import AudioSegment
-from scipy.signal import sosfilt, tf2sos, lfilter_zi
 from mutagen.id3 import ID3
 from mutagen.mp3 import MP3
 from typing import List, Dict, Any, Optional
@@ -116,21 +115,47 @@ def _format_duration(seconds: float) -> str:
 
 
 def design_peaking_filter(center_freq, q_factor, gain_db, fs):
+    """Peaking EQ filtresi tasarlar ve katsayıları döndürür"""
     A = 10 ** (gain_db / 40.0)
     w0 = 2 * np.pi * center_freq / fs
     q_factor = max(q_factor, 0.01)
     alpha = np.sin(w0) / (2 * q_factor)
-    b0, b1, b2 = 1 + alpha * A, -2 * np.cos(w0), 1 - alpha * A
-    a0, a1, a2 = 1 + alpha / A, -2 * np.cos(w0), 1 - alpha / A
-    b, a = np.array([b0, b1, b2]) / a0, np.array([a0, a1, a2]) / a0
-    return tf2sos(b, a)
+
+    # Biquad filter coefficients
+    b0 = 1 + alpha * A
+    b1 = -2 * np.cos(w0)
+    b2 = 1 - alpha * A
+    a0 = 1 + alpha / A
+    a1 = -2 * np.cos(w0)
+    a2 = 1 - alpha / A
+
+    # Normalize coefficients
+    b = np.array([b0, b1, b2]) / a0
+    a = np.array([a0, a1, a2]) / a0
+
+    return {"b": b, "a": a}
 
 
-def get_sos_zi(sos):
-    zi = []
-    for section in sos:
-        zi.append(lfilter_zi(section[:3], section[3:]))
-    return np.array(zi)
+def apply_biquad_filter(data, filter_coeffs, zi=None):
+    """Biquad filtre uygular"""
+    if zi is None:
+        zi = np.zeros(2)
+
+    b = filter_coeffs["b"]
+    a = filter_coeffs["a"]
+
+    output = np.zeros_like(data)
+
+    for i in range(len(data)):
+        # Direct Form II implementation
+        w = data[i] - a[1] * zi[0] - a[2] * zi[1]
+        output[i] = b[0] * w + b[1] * zi[0] + b[2] * zi[1]
+
+        # Update delay line
+        zi[1] = zi[0]
+        zi[0] = w
+
+    return output, zi
 
 
 class AudioEngine:
@@ -146,7 +171,7 @@ class AudioEngine:
         self.current_frame = 0
         self.playback_thread: Optional[threading.Thread] = None
         self.playback_lock = threading.Lock()
-        self.filters: List[Optional[np.ndarray]] = [None] * len(FREQ_BANDS)
+        self.filters: List[Optional[Dict]] = [None] * len(FREQ_BANDS)
         self.filter_states: List[Optional[np.ndarray]] = [None] * len(FREQ_BANDS)
         self.ui_progress_callback = on_progress_update
         self.ui_visualizer_callback = on_visualization_update
@@ -220,8 +245,8 @@ class AudioEngine:
                         FREQ_BANDS[i], q_factor, gain, self.song.frame_rate
                     )
                     if self.filter_states[i] is None and self.song:
-                        zi = get_sos_zi(self.filters[i])
-                        self.filter_states[i] = np.array([zi] * self.song.channels)
+                        # Initialize filter state for each channel
+                        self.filter_states[i] = np.zeros((self.song.channels, 2))
 
     def _playback_loop(self):
         if not self.song or self.audio_data is None:
@@ -255,18 +280,28 @@ class AudioEngine:
     def _apply_filters(self, chunk: np.ndarray) -> np.ndarray:
         processed_chunk = chunk.copy()
         with self.playback_lock:
-            for i, sos in enumerate(self.filters):
-                if sos is not None and self.filter_states[i] is not None:
+            for i, filter_coeffs in enumerate(self.filters):
+                if filter_coeffs is not None and self.filter_states[i] is not None:
                     if processed_chunk.ndim == 2:
-                        processed_chunk[:, 0], self.filter_states[i][0] = sosfilt(
-                            sos, processed_chunk[:, 0], zi=self.filter_states[i][0]
+                        # Stereo - process each channel separately
+                        processed_chunk[:, 0], self.filter_states[i][0] = (
+                            apply_biquad_filter(
+                                processed_chunk[:, 0],
+                                filter_coeffs,
+                                zi=self.filter_states[i][0],
+                            )
                         )
-                        processed_chunk[:, 1], self.filter_states[i][1] = sosfilt(
-                            sos, processed_chunk[:, 1], zi=self.filter_states[i][1]
+                        processed_chunk[:, 1], self.filter_states[i][1] = (
+                            apply_biquad_filter(
+                                processed_chunk[:, 1],
+                                filter_coeffs,
+                                zi=self.filter_states[i][1],
+                            )
                         )
                     else:
-                        processed_chunk, self.filter_states[i][0] = sosfilt(
-                            sos, processed_chunk, zi=self.filter_states[i][0]
+                        # Mono
+                        processed_chunk, self.filter_states[i][0] = apply_biquad_filter(
+                            processed_chunk, filter_coeffs, zi=self.filter_states[i][0]
                         )
         return np.clip(processed_chunk, -1.0, 1.0)
 
@@ -274,11 +309,10 @@ class AudioEngine:
         if not self.song:
             return
         self.filter_states = []
-        for sos in self.filters:
-            if sos is not None:
-                self.filter_states.append(
-                    np.array([get_sos_zi(sos)] * self.song.channels)
-                )
+        for filter_coeffs in self.filters:
+            if filter_coeffs is not None:
+                # Initialize filter state for each channel (2 delay elements per channel)
+                self.filter_states.append(np.zeros((self.song.channels, 2)))
             else:
                 self.filter_states.append(None)
 
@@ -645,14 +679,15 @@ class RealtimeEqualizer(ctk.CTk):
             else:
                 entry["filepath"] = None
             self._create_library_entry_widget(entry)
-
-        display_name = os.path.basename(directory) if directory else "Dahili Kütüphane"
-        self.music_list_frame.configure(
-            label_text=f"Müzik Kütüphanesi ({display_name})"
-        )
-        self.status_label.configure(
-            text=f"{matched_count} / {len(MUSIC_CATALOG)} eser eşleştirildi."
-        )
+            display_name = (
+                os.path.basename(directory) if directory else "Interne Bibliothek"
+            )
+            self.music_list_frame.configure(
+                label_text=f"Musikbibliothek ({display_name})"
+            )
+            self.status_label.configure(
+                text=f"{matched_count} / {len(MUSIC_CATALOG)} Werke gefunden."
+            )
 
     def _create_library_entry_widget(self, entry: Dict[str, Any]):
         entry_frame = ctk.CTkFrame(self.music_list_frame, fg_color=("gray85", "gray20"))
