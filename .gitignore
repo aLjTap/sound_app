@@ -1,0 +1,15 @@
+./dist
+./build
+node_modules
+.DS_Store
+.env
+*.log
+coverage
+.vscode
+.idea
+*.swp
+# python
+*.pyc
+__pycache__
+# macOS
+*.DS_Store
