@@ -2,27 +2,26 @@
 
 block_cipher = None
 
-# --- EN ÖNEMLİ BÖLÜM BURASI ---
-# 'datas' listesi, Python kodunuz dışındaki dosyaları ve klasörleri
-# uygulamanıza eklemek için kullanılır.
-# Format: ('kaynak_dosya_veya_klasör', 'uygulamanın_içinde_gideceği_yer')
+# 'datas' listesi, kod dışındaki varlıkları uygulamaya dahil eder.
+# PyInstaller'a 'ffmpeg' ve 'music' klasörlerini kopyalamasını söylüyoruz.
+# ('Kaynak klasör/dosya', 'Paket içindeki hedef klasör')
 datas_to_include = [
-    ('music', 'music'),   # 'music' klasörünü al ve uygulamanın içine 'music' olarak koy.
-    ('ffmpeg', 'ffmpeg')    # 'ffmpeg' klasörünü al ve uygulamanın içine 'ffmpeg' olarak koy.
+    ('music', 'music'),                   # Müzik dosyalarını ekle
+    ('ffmpeg/windows', 'ffmpeg/windows'), # Windows için FFmpeg
+    ('ffmpeg/macos', 'ffmpeg/macos'),     # macOS için FFmpeg (platformlar arası uyumluluk için)
+    ('ffmpeg/linux', 'ffmpeg/linux')      # Linux için FFmpeg (platformlar arası uyumluluk için)
 ]
-# -----------------------------
 
 a = Analysis(
-    ['main.py'],
-    pathex=['.'], # Proje ana dizini
+    ['equalizer_app.py'],  # ANA PYTHON DOSYANIZIN ADI
+    pathex=['.'],          # Proje kök dizini
     binaries=[],
-    datas=datas_to_include, # Yukarıda tanımladığımız listeyi burada kullanıyoruz.
+    datas=datas_to_include,
     hiddenimports=[
-        # PyInstaller'ın bazen gözden kaçırdığı gizli bağımlılıklar.
-        # Bunları eklemek olası hataları önler.
+        # PyInstaller'ın gözden kaçırabileceği önemli modülleri ekliyoruz.
         'pydub.utils',
-        'scipy.signal._sosfilt',
-        'scipy._lib.messagestream'
+        'mutagen',
+        'platform'
     ],
     hookspath=[],
     runtime_hooks=[],
@@ -34,27 +33,21 @@ a = Analysis(
 )
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
+# --- Windows için EXE OLUŞTURMA BÖLÜMÜ ---
 exe = EXE(
     pyz,
     a.scripts,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
     [],
-    exclude_binaries=True,
-    name='ProEqualizer',
+    name='ProEqualizer', # Oluşturulacak .exe dosyasının adı
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
-    console=False, # GUI uygulaması için 'False' olmalı.
-)
-
-# --- macOS için APP BUNDLE OLUŞTURMA ---
-# Bu bölüm, .exe yerine .app uzantılı bir uygulama paketi oluşturur.
-app = BUNDLE(
-    exe,
-    name='ProEqualizer.app',
-    icon=None, # İsterseniz bir .icns dosya yolu ekleyebilirsiniz.
-    bundle_identifier=None,
-    info_plist={
-        'NSHighResolutionCapable': 'True'
-    }
+    upx_exclude=[],
+    runtime_tmpdir=None,
+    console=False, # GUI uygulaması olduğu için konsol penceresi olmasın.
+    # icon='icon.ico' # İSTEĞE BAĞLI: .ico uzantılı ikon dosyanız varsa bu satırı aktif edin.
 )

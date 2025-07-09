@@ -170,12 +170,96 @@ class AudioEngine:
         self.is_paused = False
         self.current_frame = 0
         self.playback_thread: Optional[threading.Thread] = None
-        self.playback_lock = threading.Lock()
+
+        # --- DEĞİŞİKLİK 1: Kilitleri ayırın ---
+        self.playback_lock = threading.Lock()  # Sadece çalma pozisyonu için
+        self.eq_lock = threading.Lock()  # Sadece EQ ayarları için YENİ KİLİT
+
         self.filters: List[Optional[Dict]] = [None] * len(FREQ_BANDS)
         self.filter_states: List[Optional[np.ndarray]] = [None] * len(FREQ_BANDS)
         self.ui_progress_callback = on_progress_update
         self.ui_visualizer_callback = on_visualization_update
         self.ui_stop_callback = on_playback_stopped
+
+    # ... (load_song, play, stop, toggle_pause, seek, seek_to_frame metodları aynı kalıyor) ...
+
+    def update_eq(self, gains_db: List[float], q_factor: float):
+        if not self.song:
+            return
+        # --- DEĞİŞİKLİK 2: Doğru kilidi kullanın ---
+        with self.eq_lock:  # playback_lock yerine eq_lock kullanılıyor
+            for i, gain in enumerate(gains_db):
+                if abs(gain) < 0.1:
+                    self.filters[i], self.filter_states[i] = None, None
+                else:
+                    self.filters[i] = design_peaking_filter(
+                        FREQ_BANDS[i], q_factor, gain, self.song.frame_rate
+                    )
+                    if self.filter_states[i] is None and self.song:
+                        # Initialize filter state for each channel
+                        self.filter_states[i] = np.zeros((self.song.channels, 2))
+
+    def _playback_loop(self):
+        if not self.song or self.audio_data is None:
+            return
+        self.stream = self.p.open(
+            format=pyaudio.paFloat32,
+            channels=self.song.channels,
+            rate=self.song.frame_rate,
+            output=True,
+            frames_per_buffer=CHUNK_SIZE,
+        )
+        while self.is_playing:
+            while self.is_paused and self.is_playing:
+                time.sleep(0.1)
+            if not self.is_playing:
+                break
+            # Bu kilit sadece current_frame'i koruyor, bu yüzden çok hızlı.
+            with self.playback_lock:
+                start, end = self.current_frame, self.current_frame + CHUNK_SIZE
+                if end > len(self.audio_data):
+                    break
+                chunk, self.current_frame = self.audio_data[start:end], end
+
+            # Filtreleme artık kendi kilidini kullanıyor ve çalma akışını bozmuyor.
+            processed_chunk = self._apply_filters(chunk)
+
+            self.stream.write(processed_chunk.tobytes())
+            self.ui_progress_callback(self.current_frame, self.song.duration_seconds)
+            self.ui_visualizer_callback(
+                processed_chunk[:, 0] if processed_chunk.ndim == 2 else processed_chunk
+            )
+        self.stop()
+        self.ui_stop_callback()
+
+    def _apply_filters(self, chunk: np.ndarray) -> np.ndarray:
+        processed_chunk = chunk.copy()
+        # --- DEĞİŞİKLİK 3: Doğru kilidi kullanın ---
+        with self.eq_lock:  # playback_lock yerine eq_lock kullanılıyor
+            for i, filter_coeffs in enumerate(self.filters):
+                if filter_coeffs is not None and self.filter_states[i] is not None:
+                    if processed_chunk.ndim == 2:
+                        # Stereo - process each channel separately
+                        processed_chunk[:, 0], self.filter_states[i][0] = (
+                            apply_biquad_filter(
+                                processed_chunk[:, 0],
+                                filter_coeffs,
+                                zi=self.filter_states[i][0],
+                            )
+                        )
+                        processed_chunk[:, 1], self.filter_states[i][1] = (
+                            apply_biquad_filter(
+                                processed_chunk[:, 1],
+                                filter_coeffs,
+                                zi=self.filter_states[i][1],
+                            )
+                        )
+                    else:
+                        # Mono
+                        processed_chunk, self.filter_states[i][0] = apply_biquad_filter(
+                            processed_chunk, filter_coeffs, zi=self.filter_states[i][0]
+                        )
+        return np.clip(processed_chunk, -1.0, 1.0)
 
     def load_song(self, filepath: str) -> bool:
         try:
@@ -247,63 +331,6 @@ class AudioEngine:
                     if self.filter_states[i] is None and self.song:
                         # Initialize filter state for each channel
                         self.filter_states[i] = np.zeros((self.song.channels, 2))
-
-    def _playback_loop(self):
-        if not self.song or self.audio_data is None:
-            return
-        self.stream = self.p.open(
-            format=pyaudio.paFloat32,
-            channels=self.song.channels,
-            rate=self.song.frame_rate,
-            output=True,
-            frames_per_buffer=CHUNK_SIZE,
-        )
-        while self.is_playing:
-            while self.is_paused and self.is_playing:
-                time.sleep(0.1)
-            if not self.is_playing:
-                break
-            with self.playback_lock:
-                start, end = self.current_frame, self.current_frame + CHUNK_SIZE
-                if end > len(self.audio_data):
-                    break
-                chunk, self.current_frame = self.audio_data[start:end], end
-            processed_chunk = self._apply_filters(chunk)
-            self.stream.write(processed_chunk.tobytes())
-            self.ui_progress_callback(self.current_frame, self.song.duration_seconds)
-            self.ui_visualizer_callback(
-                processed_chunk[:, 0] if processed_chunk.ndim == 2 else processed_chunk
-            )
-        self.stop()
-        self.ui_stop_callback()
-
-    def _apply_filters(self, chunk: np.ndarray) -> np.ndarray:
-        processed_chunk = chunk.copy()
-        with self.playback_lock:
-            for i, filter_coeffs in enumerate(self.filters):
-                if filter_coeffs is not None and self.filter_states[i] is not None:
-                    if processed_chunk.ndim == 2:
-                        # Stereo - process each channel separately
-                        processed_chunk[:, 0], self.filter_states[i][0] = (
-                            apply_biquad_filter(
-                                processed_chunk[:, 0],
-                                filter_coeffs,
-                                zi=self.filter_states[i][0],
-                            )
-                        )
-                        processed_chunk[:, 1], self.filter_states[i][1] = (
-                            apply_biquad_filter(
-                                processed_chunk[:, 1],
-                                filter_coeffs,
-                                zi=self.filter_states[i][1],
-                            )
-                        )
-                    else:
-                        # Mono
-                        processed_chunk, self.filter_states[i][0] = apply_biquad_filter(
-                            processed_chunk, filter_coeffs, zi=self.filter_states[i][0]
-                        )
-        return np.clip(processed_chunk, -1.0, 1.0)
 
     def _initialize_filter_states(self):
         if not self.song:
