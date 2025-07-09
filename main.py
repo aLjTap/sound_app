@@ -13,6 +13,7 @@ from mutagen.id3 import ID3
 from mutagen.mp3 import MP3
 from typing import List, Dict, Any, Optional
 import sys
+import platform
 
 CHUNK_SIZE = 1024 * 4
 MAX_GAIN_DB = 12.0
@@ -98,7 +99,13 @@ def resource_path(relative_path):
 # --- Pydub için FFmpeg yolunu ayarla ---
 # =============================================================================
 # Bu satır, pydub'ın paketlenmiş uygulamadaki ffmpeg.exe'yi bulmasını sağlar.
-AudioSegment.converter = resource_path("ffmpeg/ffmpeg.exe")
+# Detect operating system and set appropriate ffmpeg binary
+if platform.system() == "Windows":
+    AudioSegment.converter = resource_path("ffmpeg/windows/ffmpeg")
+elif platform.system() == "Darwin":  # macOS
+    AudioSegment.converter = resource_path("ffmpeg/macos/ffmpeg")
+else:  # Linux and other Unix-like systems
+    AudioSegment.converter = resource_path("ffmpeg/ffmpeg")
 # Bazen ffprobe da gerekebilir, garanti olsun diye ekleyelim.
 # AudioSegment.ffprobe = resource_path("ffmpeg/ffprobe.exe") # Genellikle converter'ı ayarlamak yeterlidir.
 
