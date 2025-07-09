@@ -4,3 +4,5 @@ customtkinter
 pydub
 mutagen
 ffmpeg
+pyinstaller
+numba
