@@ -6,3 +6,4 @@ mutagen
 ffmpeg
 pyinstaller
 numba
+pyFFTW
