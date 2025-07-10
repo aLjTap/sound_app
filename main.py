@@ -3,6 +3,7 @@ from tkinter import filedialog, messagebox
 import customtkinter as ctk
 import numpy as np
 import pyfftw
+
 fft_module = pyfftw.interfaces.numpy_fft
 import pyaudio
 import threading
@@ -105,6 +106,7 @@ elif platform.system() == "Darwin":  # macOS
 else:
     AudioSegment.converter = resource_path("ffmpeg/ffmpeg")
 
+
 def _format_duration(seconds: float) -> str:
     mins, secs = divmod(seconds, 60)
     return f"{int(mins):02d}:{int(secs):02d}"
@@ -132,15 +134,16 @@ def design_peaking_filter(center_freq, q_factor, gain_db, fs):
     return {"b": b, "a": a}
 
 
-
 # --- Numba ile hızlandırılmış zincirleme filtre uygulaması ---
 try:
     from numba import njit
+
     NUMBA_AVAILABLE = True
 except ImportError:
     NUMBA_AVAILABLE = False
 
 if NUMBA_AVAILABLE:
+
     @njit(cache=True)
     def chain_biquad_filters(data, filters_b, filters_a, filters_zi, num_filters):
         out = data.copy()
@@ -155,7 +158,9 @@ if NUMBA_AVAILABLE:
                 z1, z0 = z0, w
             filters_zi[f, 0], filters_zi[f, 1] = z0, z1
         return out, filters_zi
+
 else:
+
     def chain_biquad_filters(data, filters_b, filters_a, filters_zi, num_filters):
         out = data.copy()
         for f in range(num_filters):
@@ -218,8 +223,12 @@ class AudioEngine:
                     # Eğer filtre katsayıları değişmediyse state'i koru
                     if (
                         self.filters[i] is not None
-                        and np.allclose(self.filters[i]["b"], new_filter["b"], atol=1e-6)
-                        and np.allclose(self.filters[i]["a"], new_filter["a"], atol=1e-6)
+                        and np.allclose(
+                            self.filters[i]["b"], new_filter["b"], atol=1e-6
+                        )
+                        and np.allclose(
+                            self.filters[i]["a"], new_filter["a"], atol=1e-6
+                        )
                     ):
                         # Aynı filtre, state'i koru
                         pass
@@ -265,7 +274,11 @@ class AudioEngine:
         processed_chunk = chunk.copy()
         with self.playback_lock:
             # Aktif filtrelerin indekslerini topla
-            active_idx = [i for i, f in enumerate(self.filters) if f is not None and self.filter_states[i] is not None]
+            active_idx = [
+                i
+                for i, f in enumerate(self.filters)
+                if f is not None and self.filter_states[i] is not None
+            ]
             if not active_idx:
                 return np.clip(processed_chunk, -1.0, 1.0)
 
@@ -275,7 +288,9 @@ class AudioEngine:
                 filters_b = np.stack([self.filters[i]["b"] for i in active_idx])
                 filters_a = np.stack([self.filters[i]["a"] for i in active_idx])
                 filters_zi = np.stack([self.filter_states[i][0] for i in active_idx])
-                out, new_zi = chain_biquad_filters(processed_chunk, filters_b, filters_a, filters_zi, num_filters)
+                out, new_zi = chain_biquad_filters(
+                    processed_chunk, filters_b, filters_a, filters_zi, num_filters
+                )
                 processed_chunk = out
                 for idx, i in enumerate(active_idx):
                     self.filter_states[i][0] = new_zi[idx]
@@ -284,8 +299,16 @@ class AudioEngine:
                 for ch in range(2):
                     filters_b = np.stack([self.filters[i]["b"] for i in active_idx])
                     filters_a = np.stack([self.filters[i]["a"] for i in active_idx])
-                    filters_zi = np.stack([self.filter_states[i][ch] for i in active_idx])
-                    out, new_zi = chain_biquad_filters(processed_chunk[:, ch], filters_b, filters_a, filters_zi, num_filters)
+                    filters_zi = np.stack(
+                        [self.filter_states[i][ch] for i in active_idx]
+                    )
+                    out, new_zi = chain_biquad_filters(
+                        processed_chunk[:, ch],
+                        filters_b,
+                        filters_a,
+                        filters_zi,
+                        num_filters,
+                    )
                     processed_chunk[:, ch] = out
                     for idx, i in enumerate(active_idx):
                         self.filter_states[i][ch] = new_zi[idx]
@@ -384,7 +407,7 @@ class RealtimeEqualizer(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title("Python Pro Equalizer")
-        self.geometry("850x850")
+        self.geometry("1000x900")  # Daha büyük pencere
         ctk.set_appearance_mode("Dark")
         ctk.set_default_color_theme("blue")
         self.audio_engine = AudioEngine(
@@ -404,13 +427,14 @@ class RealtimeEqualizer(ctk.CTk):
 
     def _setup_ui(self):
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(5, weight=1)
+        self.grid_rowconfigure(3, weight=1)  # Visualizer için
+        self.grid_rowconfigure(5, weight=2)  # Kütüphane için daha fazla yer
         self._create_info_panel().grid(row=0, column=0, padx=20, pady=10, sticky="ew")
         self._create_progress_bar_panel().grid(
             row=1, column=0, padx=20, pady=0, sticky="ew"
         )
         self._create_player_controls().grid(row=2, column=0, pady=10)
-        self._create_visualizer().grid(row=3, column=0, padx=20, pady=0, sticky="ewns")
+        self._create_visualizer().grid(row=3, column=0, padx=20, pady=5, sticky="ewns")
         self._create_equalizer_panel().grid(
             row=4, column=0, padx=20, pady=10, sticky="ew"
         )
@@ -489,21 +513,21 @@ class RealtimeEqualizer(ctk.CTk):
         frame.grid_columnconfigure(1, weight=1)
         frame.grid_rowconfigure(0, weight=1)
         self.db_label_canvas = tk.Canvas(
-            frame, bg="black", width=50, height=180, highlightthickness=0
+            frame, bg="black", width=50, height=140, highlightthickness=0
         )
         self.db_label_canvas.grid(row=0, column=0, sticky="ns", pady=5, padx=(5, 0))
-        self.vis_canvas = tk.Canvas(frame, bg="black", height=180, highlightthickness=0)
+        self.vis_canvas = tk.Canvas(frame, bg="black", height=140, highlightthickness=0)
         self.vis_canvas.grid(row=0, column=1, sticky="nsew", pady=5, padx=(0, 5))
         self.label_canvas = tk.Canvas(
             frame, bg="black", height=25, highlightthickness=0
         )
         self.label_canvas.grid(row=1, column=1, sticky="ew", padx=(0, 5), pady=(0, 5))
         self._draw_db_labels()
-        canvas_width = 850 - 40 - 50 - 10
+        canvas_width = 1000 - 40 - 50 - 10  # Yeni pencere genişliği için güncelle
         bar_width = canvas_width / NUM_VIS_BARS
         self.vis_bars = [
             self.vis_canvas.create_rectangle(
-                i * bar_width, 180, (i + 1) * bar_width, 180, fill="#1f77b4", outline=""
+                i * bar_width, 140, (i + 1) * bar_width, 140, fill="#1f77b4", outline=""
             )
             for i in range(NUM_VIS_BARS)
         ]
@@ -664,7 +688,7 @@ class RealtimeEqualizer(ctk.CTk):
         magnitudes = 20 * np.log10(np.abs(fft_result) + 1e-9)
         canvas_height = self.vis_canvas.winfo_height()
         if canvas_height <= 1:
-            canvas_height = 180
+            canvas_height = 140  # Yeni yükseklik
         num_fft_bins, log_indices = len(magnitudes), np.logspace(
             0, np.log10(len(magnitudes) - 1), NUM_VIS_BARS + 1, dtype=int
         )
@@ -753,34 +777,45 @@ class RealtimeEqualizer(ctk.CTk):
 
     def _create_library_entry_widget(self, entry: Dict[str, Any]):
         entry_frame = ctk.CTkFrame(self.music_list_frame, fg_color=("gray85", "gray20"))
-        entry_frame.pack(fill="x", expand=True, pady=5, padx=5)
+        entry_frame.pack(fill="x", expand=True, pady=3, padx=5)
         entry_frame.grid_columnconfigure(0, weight=1)
+
+        # Ana bilgi frame'i
         info_frame = ctk.CTkFrame(entry_frame, fg_color="transparent")
-        info_frame.grid(row=0, column=0, padx=10, pady=10, sticky="ew")
+        info_frame.grid(row=0, column=0, padx=10, pady=8, sticky="ew")
+
+        # Başlık daha büyük ve bold
         title_text = f"{entry['composer']}: {entry['title']}"
         ctk.CTkLabel(
             info_frame,
             text=title_text,
-            font=ctk.CTkFont(size=14, weight="bold"),
+            font=ctk.CTkFont(size=13, weight="bold"),
             anchor="w",
         ).pack(fill="x")
+
+        # Açıklama daha küçük ama okunabilir
         ctk.CTkLabel(
             info_frame,
             text=entry["description"],
-            font=ctk.CTkFont(size=12),
+            font=ctk.CTkFont(size=11),
             anchor="w",
             justify=tk.LEFT,
-            wraplength=600,
-        ).pack(fill="x", pady=(5, 0))
+            wraplength=700,  # Daha geniş wrap
+            text_color=("gray10", "gray70"),  # Daha soft renk
+        ).pack(fill="x", pady=(3, 0))
+
+        # Buton frame'i
         button_frame = ctk.CTkFrame(entry_frame, fg_color="transparent")
-        button_frame.grid(row=0, column=1, padx=10, pady=10)
+        button_frame.grid(row=0, column=1, padx=10, pady=8)
         button_state = "normal" if entry["filepath"] else "disabled"
-        button_text = "Spielen" if entry["filepath"] else "Datei fehlt"
+        button_text = "▶ Spielen" if entry["filepath"] else "❌ Datei fehlt"
         play_button = ctk.CTkButton(
             button_frame,
             text=button_text,
-            width=100,
+            width=110,
+            height=32,
             state=button_state,
+            font=ctk.CTkFont(size=12),
             command=lambda fp=entry["filepath"]: self.play_mp3_file(fp) if fp else None,
         )
         play_button.pack(expand=True)
@@ -792,42 +827,47 @@ class RealtimeEqualizer(ctk.CTk):
 
     def _draw_db_labels(self):
         self.db_label_canvas.delete("all")
-        canvas_height = 180
-        for db_val in range(12, -60, -6):
-            if db_val == 0:
-                continue
+        canvas_height = 140  # Yeni yükseklik
+
+        # Daha uygun aralıklarla dB değerleri göster
+        db_values = [12, 0, -12, -24, -36, -48]
+
+        for db_val in db_values:
             y_pos = canvas_height - (
                 ((db_val - VIS_MIN_DB) / VIS_DB_RANGE) * canvas_height
             )
-            text = f"+{db_val}" if db_val > 0 else str(db_val)
+
             if 0 <= y_pos <= canvas_height:
+                # 0 dB özel renk ve kalınlık
+                if db_val == 0:
+                    color = "white"
+                    font_style = ("Arial", 9, "bold")
+                    # 0 dB için çizgi ekle
+                    self.db_label_canvas.create_line(
+                        35, y_pos, 50, y_pos, fill="white", width=2
+                    )
+                else:
+                    color = "lightgray"
+                    font_style = ("Arial", 8)
+
+                # Pozitif değerler için + işareti ekle
+                text = f"+{db_val}" if db_val > 0 else str(db_val)
+
                 self.db_label_canvas.create_text(
                     25,
                     y_pos,
                     text=text,
-                    fill="lightgray",
-                    font=("Arial", 9),
+                    fill=color,
+                    font=font_style,
                     anchor="center",
                 )
-        zero_db_y = canvas_height - (((0 - VIS_MIN_DB) / VIS_DB_RANGE) * canvas_height)
-        self.db_label_canvas.create_line(
-            45, zero_db_y, 50, zero_db_y, fill="white", width=1
-        )
-        self.db_label_canvas.create_text(
-            25,
-            zero_db_y,
-            text="0dB",
-            fill="white",
-            font=("Arial", 9, "bold"),
-            anchor="center",
-        )
 
     def _update_visualizer_freq_labels(self):
         self.label_canvas.delete("all")
         if not self.audio_engine.song:
             return
 
-        canvas_width = 850 - 40 - 50 - 10
+        canvas_width = 1000 - 40 - 50 - 10  # Yeni pencere genişliği için güncelle
         bar_width = canvas_width / NUM_VIS_BARS
         fft_freqs = np.fft.rfftfreq(CHUNK_SIZE, 1 / self.audio_engine.song.frame_rate)
         log_indices = np.logspace(
