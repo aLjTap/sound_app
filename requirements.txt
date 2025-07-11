@@ -7,3 +7,4 @@ ffmpeg
 pyinstaller
 numba
 pyFFTW
+scipy
