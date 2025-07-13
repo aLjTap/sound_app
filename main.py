@@ -11,11 +11,16 @@ from pydub import AudioSegment
 from scipy.signal import sosfilt, tf2sos, lfilter_zi
 from mutagen.id3 import ID3
 from mutagen.mp3 import MP3
-from typing import List, Dict, Any, Optional
-import sys
+from typing import List, Dict, Any, Optional, Callable
 import platform
+import sys
 
-CHUNK_SIZE = 1024 * 2  # Daha küçük chunk size daha stabil playback
+# =============================================================================
+# --- UYGULAMA AYARLARI VE VERİLER ---
+# =============================================================================
+
+# --- Ses Ayarları ---
+CHUNK_SIZE = 1024 * 4
 MAX_GAIN_DB = 12.0
 SEEK_SECONDS = 5
 FREQ_BANDS = [60, 170, 310, 600, 1000, 3000, 6000, 12000, 14000, 16000]
@@ -32,11 +37,13 @@ BAND_LABELS = [
     "Ultra-Höhen",
 ]
 
+# --- Görselleştirme Ayarları ---
 NUM_VIS_BARS = 30
 VIS_MIN_DB = -60.0
 VIS_MAX_DB = 15.0
 VIS_DB_RANGE = VIS_MAX_DB - VIS_MIN_DB
 
+# --- Müzik Kütüphanesi Kataloğu ---
 MUSIC_CATALOG: List[Dict[str, Any]] = [
     {
         "composer": "Ludwig van Beethoven",
@@ -133,6 +140,9 @@ def get_sos_zi(sos):
     return np.array(zi)
 
 
+# =============================================================================
+# --- SES MOTORU SINIFI ---
+# =============================================================================
 class AudioEngine:
     def __init__(
         self, on_progress_update, on_visualization_update, on_playback_stopped
@@ -151,9 +161,6 @@ class AudioEngine:
         self.ui_progress_callback = on_progress_update
         self.ui_visualizer_callback = on_visualization_update
         self.ui_stop_callback = on_playback_stopped
-
-        # Audio performans optimizasyonu için
-        self.last_ui_update = 0
 
     def load_song(self, filepath: str) -> bool:
         try:
@@ -180,14 +187,6 @@ class AudioEngine:
             self.playback_thread = threading.Thread(
                 target=self._playback_loop, daemon=True
             )
-            # Thread priority'sini artır (sadece Unix sistemlerde)
-            try:
-                import os
-
-                if hasattr(os, "nice"):
-                    os.nice(-5)  # Daha yüksek priority
-            except:
-                pass
             self.playback_thread.start()
 
     def stop(self):
@@ -206,128 +205,87 @@ class AudioEngine:
 
     def seek(self, seconds_offset: float):
         if self.song and self.audio_data is not None:
+            ## DÜZELTME BAŞLANGICI: Göreceli seek işlemini, mutlak seek'i kullanacak şekilde yeniden düzenledik.
             frame_offset = int(seconds_offset * self.song.frame_rate)
             new_frame = self.current_frame + frame_offset
             self.seek_to_frame(new_frame)
+            ## DÜZELTME SONU
 
+    ## DÜZELTME BAŞLANGICI: Slider'dan gelen mutlak konuma atlamak için yeni bir fonksiyon ekledik.
     def seek_to_frame(self, target_frame: int):
+        """Müziği belirtilen mutlak frame (örnek) numarasına taşır."""
         if self.song and self.audio_data is not None:
             with self.playback_lock:
+                # Hedef frame'in ses verisi sınırları içinde olduğundan emin ol
                 safe_target_frame = max(
                     0, min(target_frame, len(self.audio_data) - CHUNK_SIZE)
                 )
                 self.current_frame = safe_target_frame
-                # Seek sonrası filter state'lerini yeniden başlat
-                self._reinitialize_filter_states()
+                # Konumda büyük bir atlama yapıldığı için filtrelerin durumunu sıfırla
+                self._initialize_filter_states()
+
+    ## DÜZELTME SONU
 
     def update_eq(self, gains_db: List[float], q_factor: float):
         if not self.song:
             return
-        # EQ güncelleme sırasında playback'i durdurmayalım, sadece filtreleri güncelleyelim
-        for i, gain in enumerate(gains_db):
-            if abs(gain) < 0.1:
-                self.filters[i], self.filter_states[i] = None, None
-            else:
-                new_filter = design_peaking_filter(
-                    FREQ_BANDS[i], q_factor, gain, self.song.frame_rate
-                )
-                self.filters[i] = new_filter
-                if self.filter_states[i] is None and self.song:
-                    zi = get_sos_zi(new_filter)
-                    self.filter_states[i] = np.array([zi] * self.song.channels)
+        with self.playback_lock:
+            for i, gain in enumerate(gains_db):
+                if abs(gain) < 0.1:
+                    self.filters[i], self.filter_states[i] = None, None
+                else:
+                    self.filters[i] = design_peaking_filter(
+                        FREQ_BANDS[i], q_factor, gain, self.song.frame_rate
+                    )
+                    if self.filter_states[i] is None and self.song:
+                        zi = get_sos_zi(self.filters[i])
+                        self.filter_states[i] = np.array([zi] * self.song.channels)
 
     def _playback_loop(self):
         if not self.song or self.audio_data is None:
             return
-
-        # Daha büyük buffer ve düşük latency için optimize edilmiş ayarlar
         self.stream = self.p.open(
             format=pyaudio.paFloat32,
             channels=self.song.channels,
             rate=self.song.frame_rate,
             output=True,
             frames_per_buffer=CHUNK_SIZE,
-            stream_callback=None,  # Blocking mode kullan
         )
-
-        # Buffer için biraz daha fazla chunk hazırla
-        buffer_chunks = 3
-
         while self.is_playing:
             while self.is_paused and self.is_playing:
-                time.sleep(0.05)  # Daha kısa bekleme süresi
+                time.sleep(0.1)
             if not self.is_playing:
                 break
-
-            try:
-                with self.playback_lock:
-                    start, end = self.current_frame, self.current_frame + CHUNK_SIZE
-                    if end > len(self.audio_data):
-                        break
-                    chunk, self.current_frame = self.audio_data[start:end], end
-
-                # Filter işlemini lock dışında yap
-                processed_chunk = self._apply_filters(chunk)
-
-                # Audio stream'e yaz
-                if self.stream and self.stream.is_active():
-                    self.stream.write(
-                        processed_chunk.tobytes(), exception_on_underflow=False
-                    )
-
-                # UI güncellemelerini daha az sıklıkta yap
-                if self.current_frame % (CHUNK_SIZE * 4) == 0:
-                    self.ui_progress_callback(
-                        self.current_frame, self.song.duration_seconds
-                    )
-                    
-                # Visualizer'ı her seferinde güncelle ama daha güvenli bir şekilde
-                try:
-                    self.ui_visualizer_callback(
-                        processed_chunk[:, 0]
-                        if processed_chunk.ndim == 2
-                        else processed_chunk
-                    )
-                except Exception as viz_error:
-                    # Visualizer hatası playback'i etkilemesin
-                    pass
-
-            except Exception as e:
-                print(f"Playback error: {e}")
-                time.sleep(0.01)
-                continue
-
+            with self.playback_lock:
+                start, end = self.current_frame, self.current_frame + CHUNK_SIZE
+                if end > len(self.audio_data):
+                    break
+                chunk, self.current_frame = self.audio_data[start:end], end
+            processed_chunk = self._apply_filters(chunk)
+            self.stream.write(processed_chunk.tobytes())
+            self.ui_progress_callback(self.current_frame, self.song.duration_seconds)
+            self.ui_visualizer_callback(
+                processed_chunk[:, 0] if processed_chunk.ndim == 2 else processed_chunk
+            )
         self.stop()
         self.ui_stop_callback()
 
     def _apply_filters(self, chunk: np.ndarray) -> np.ndarray:
-        # Eğer hiç filtre aktif değilse, orijinal chunk'ı döndür
-        if all(f is None for f in self.filters):
-            return np.clip(chunk, -1.0, 1.0)
-
         processed_chunk = chunk.copy()
-
-        # Filter işlemlerini optimize et
-        for i, sos in enumerate(self.filters):
-            if sos is not None and self.filter_states[i] is not None:
-                try:
+        with self.playback_lock:
+            for i, sos in enumerate(self.filters):
+                if sos is not None and self.filter_states[i] is not None:
                     if processed_chunk.ndim == 2:
                         processed_chunk[:, 0], self.filter_states[i][0] = sosfilt(
                             sos, processed_chunk[:, 0], zi=self.filter_states[i][0]
                         )
-                        if processed_chunk.shape[1] > 1:  # Stereo
-                            processed_chunk[:, 1], self.filter_states[i][1] = sosfilt(
-                                sos, processed_chunk[:, 1], zi=self.filter_states[i][1]
-                            )
+                        processed_chunk[:, 1], self.filter_states[i][1] = sosfilt(
+                            sos, processed_chunk[:, 1], zi=self.filter_states[i][1]
+                        )
                     else:
                         processed_chunk, self.filter_states[i][0] = sosfilt(
                             sos, processed_chunk, zi=self.filter_states[i][0]
                         )
-                except Exception as e:
-                    print(f"Filter error: {e}")
-                    # Hata durumunda orijinal chunk'ı kullan
-                    continue
-
         return np.clip(processed_chunk, -1.0, 1.0)
 
     def _initialize_filter_states(self):
@@ -342,29 +300,21 @@ class AudioEngine:
             else:
                 self.filter_states.append(None)
 
-    def _reinitialize_filter_states(self):
-        """Seek işleminden sonra filter state'lerini temizle"""
-        if not self.song:
-            return
-        for i, sos in enumerate(self.filters):
-            if sos is not None and self.filter_states[i] is not None:
-                try:
-                    zi = get_sos_zi(sos)
-                    self.filter_states[i] = np.array([zi] * self.song.channels)
-                except:
-                    self.filter_states[i] = None
-
     def close(self):
         self.stop()
         self.p.terminate()
 
 
+# =============================================================================
+# --- ANA ARAYÜZ SINIFI ---
+# =============================================================================
 class RealtimeEqualizer(ctk.CTk):
+    """Müzik çalar ve ekolayzır için ana uygulama penceresi."""
+
     def __init__(self):
         super().__init__()
         self.title("Python Pro Equalizer")
-        self.geometry("1200x1200")
-        self.minsize(1100, 1000)
+        self.geometry("850x700")  # Yüksekliği 850'den 700'e düşürdük
         ctk.set_appearance_mode("Dark")
         ctk.set_default_color_theme("blue")
         self.audio_engine = AudioEngine(
@@ -383,27 +333,42 @@ class RealtimeEqualizer(ctk.CTk):
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
 
     def _setup_ui(self):
+        # Ana pencereyi scroll frame için yapılandır
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(5, weight=1)
-        self._create_info_panel().grid(row=0, column=0, padx=20, pady=5, sticky="ew")
+        self.grid_rowconfigure(0, weight=1)
+
+        # Ana scroll frame oluştur
+        self.main_scroll_frame = ctk.CTkScrollableFrame(
+            self,
+            corner_radius=0,
+            scrollbar_button_color=("gray70", "gray30"),
+            scrollbar_button_hover_color=("gray60", "gray40"),
+        )
+        self.main_scroll_frame.grid(row=0, column=0, sticky="nsew", padx=0, pady=0)
+        self.main_scroll_frame.grid_columnconfigure(0, weight=1)
+
+        # Scroll frame içindeki bileşenleri yerleştir
+        self._create_info_panel().grid(row=0, column=0, padx=20, pady=10, sticky="ew")
         self._create_progress_bar_panel().grid(
             row=1, column=0, padx=20, pady=0, sticky="ew"
         )
-        self._create_player_controls().grid(row=2, column=0, pady=5)
-        self._create_visualizer().grid(row=3, column=0, padx=20, pady=5, sticky="ew")
+        self._create_player_controls().grid(row=2, column=0, pady=10)
+        self._create_visualizer().grid(row=3, column=0, padx=20, pady=0, sticky="ew")
         self._create_equalizer_panel().grid(
-            row=4, column=0, padx=20, pady=5, sticky="ew"
+            row=4, column=0, padx=20, pady=10, sticky="ew"
         )
         self._create_library_panel().grid(
-            row=5, column=0, padx=20, pady=5, sticky="nsew"
+            row=5, column=0, padx=20, pady=10, sticky="ew"
         )
+
+        # Status label'ı ana pencereye yerleştir (scroll dışında kalması için)
         self.status_label = ctk.CTkLabel(
             self, text="Wird gestartet...", font=ctk.CTkFont(size=11)
         )
-        self.status_label.grid(row=6, column=0, pady=5, sticky="ew")
+        self.status_label.grid(row=1, column=0, pady=5, sticky="ew")
 
     def _create_info_panel(self) -> ctk.CTkFrame:
-        frame = ctk.CTkFrame(self, corner_radius=10)
+        frame = ctk.CTkFrame(self.main_scroll_frame, corner_radius=10)
         frame.grid_columnconfigure(0, weight=1)
         self.title_label = ctk.CTkLabel(
             frame,
@@ -418,7 +383,7 @@ class RealtimeEqualizer(ctk.CTk):
         return frame
 
     def _create_progress_bar_panel(self) -> ctk.CTkFrame:
-        frame = ctk.CTkFrame(self, fg_color="transparent")
+        frame = ctk.CTkFrame(self.main_scroll_frame, fg_color="transparent")
         frame.grid_columnconfigure(1, weight=1)
         self.time_label = ctk.CTkLabel(
             frame, text="00:00 / 00:00", font=ctk.CTkFont(size=11)
@@ -434,7 +399,7 @@ class RealtimeEqualizer(ctk.CTk):
         return frame
 
     def _create_player_controls(self) -> ctk.CTkFrame:
-        frame = ctk.CTkFrame(self, fg_color="transparent")
+        frame = ctk.CTkFrame(self.main_scroll_frame, fg_color="transparent")
         self.rewind_button = ctk.CTkButton(
             frame,
             text="⏪",
@@ -465,32 +430,32 @@ class RealtimeEqualizer(ctk.CTk):
         return frame
 
     def _create_visualizer(self) -> ctk.CTkFrame:
-        frame = ctk.CTkFrame(self, fg_color="black", corner_radius=10)
+        frame = ctk.CTkFrame(self.main_scroll_frame, fg_color="black", corner_radius=10)
         frame.grid_columnconfigure(1, weight=1)
         frame.grid_rowconfigure(0, weight=1)
         self.db_label_canvas = tk.Canvas(
-            frame, bg="black", width=40, height=120, highlightthickness=0
+            frame, bg="black", width=50, height=180, highlightthickness=0
         )
-        self.db_label_canvas.grid(row=0, column=0, sticky="ns", pady=3, padx=(3, 0))
-        self.vis_canvas = tk.Canvas(frame, bg="black", height=120, highlightthickness=0)
-        self.vis_canvas.grid(row=0, column=1, sticky="nsew", pady=3, padx=(0, 3))
+        self.db_label_canvas.grid(row=0, column=0, sticky="ns", pady=5, padx=(5, 0))
+        self.vis_canvas = tk.Canvas(frame, bg="black", height=180, highlightthickness=0)
+        self.vis_canvas.grid(row=0, column=1, sticky="nsew", pady=5, padx=(0, 5))
         self.label_canvas = tk.Canvas(
-            frame, bg="black", height=20, highlightthickness=0
+            frame, bg="black", height=25, highlightthickness=0
         )
-        self.label_canvas.grid(row=1, column=1, sticky="ew", padx=(0, 3), pady=(0, 3))
+        self.label_canvas.grid(row=1, column=1, sticky="ew", padx=(0, 5), pady=(0, 5))
         self._draw_db_labels()
-        canvas_width = 1200 - 40 - 40 - 10
+        canvas_width = 850 - 40 - 50 - 10
         bar_width = canvas_width / NUM_VIS_BARS
         self.vis_bars = [
             self.vis_canvas.create_rectangle(
-                i * bar_width, 120, (i + 1) * bar_width, 120, fill="#1f77b4", outline=""
+                i * bar_width, 180, (i + 1) * bar_width, 180, fill="#1f77b4", outline=""
             )
             for i in range(NUM_VIS_BARS)
         ]
         return frame
 
     def _create_equalizer_panel(self) -> ctk.CTkFrame:
-        frame = ctk.CTkFrame(self)
+        frame = ctk.CTkFrame(self.main_scroll_frame)
         frame.grid_columnconfigure(0, weight=1)
         eq_sliders_frame = ctk.CTkFrame(frame, fg_color="transparent")
         eq_sliders_frame.grid(row=0, column=0, sticky="ew", columnspan=2, pady=(5, 10))
@@ -507,7 +472,7 @@ class RealtimeEqualizer(ctk.CTk):
                 from_=-MAX_GAIN_DB,
                 to=MAX_GAIN_DB,
                 orientation="vertical",
-                height=80,
+                height=120,
                 command=lambda v, idx=i: self.on_eq_slider_change(v, idx),
                 number_of_steps=int(2 * MAX_GAIN_DB * 10),
             )
@@ -550,7 +515,7 @@ class RealtimeEqualizer(ctk.CTk):
         return frame
 
     def _create_library_panel(self) -> ctk.CTkFrame:
-        frame = ctk.CTkFrame(self, height=600)
+        frame = ctk.CTkFrame(self.main_scroll_frame)
         frame.grid_rowconfigure(1, weight=1)
         frame.grid_columnconfigure(0, weight=1)
         header = ctk.CTkFrame(frame, fg_color="transparent")
@@ -561,10 +526,11 @@ class RealtimeEqualizer(ctk.CTk):
         ctk.CTkButton(
             header, text="Ordner scannen", command=self.scan_mp3_files_dialog, width=120
         ).pack(side="right")
-        self.music_list_frame = ctk.CTkScrollableFrame(frame, height=550)
+        self.music_list_frame = ctk.CTkScrollableFrame(frame)
         self.music_list_frame.grid(row=1, column=0, sticky="nsew", padx=10, pady=5)
         return frame
 
+    # --- UI Event Handlers ---
     def play_mp3_file(self, filepath: str):
         if self.audio_engine.load_song(filepath):
             self.audio_engine.update_eq(self.gains_db, self.q_factor)
@@ -609,20 +575,29 @@ class RealtimeEqualizer(ctk.CTk):
         self.audio_engine.update_eq(self.gains_db, self.q_factor)
 
     def on_slider_press(self, _event):
+        # Fareye basıldığında, sürekli güncellemeyi geçici olarak durdurmak için bayrağı ayarla
         self.is_seeking_with_slider = True
 
+    ## DÜZELTME BAŞLANGICI: Slider bırakıldığında ses motoruna yeni konumu bildiren kod eklendi.
     def on_slider_release(self, _event):
+        # Sadece fare ile sürükleme işlemi varsa devam et
         if self.is_seeking_with_slider:
-            self.is_seeking_with_slider = False
+            self.is_seeking_with_slider = False  # Bayrağı hemen sıfırla
+            # Şarkı yüklü ve ses verisi mevcutsa
             if self.audio_engine.song and self.audio_engine.audio_data is not None:
+                # Slider'ın yeni değerini al (0-1000 arası)
                 slider_value = self.progress_bar.get()
+                # Toplam frame (örnek) sayısını al
                 total_frames = len(self.audio_engine.audio_data)
+                # Slider değerini hedef frame'e dönüştür
                 target_frame = int((slider_value / 1000.0) * total_frames)
-                self.audio_engine.seek_to_frame(target_frame)
-                
-                # Seek sonrası visualizer'ı yeniden başlat
-                self._reset_visualizer()
 
+                # Ses motoruna bu yeni frame'e atlamasını söyle
+                self.audio_engine.seek_to_frame(target_frame)
+
+    ## DÜZELTME SONU
+
+    # --- UI Update Callbacks ---
     def update_ui_on_progress(self, current_frame: int, total_seconds: float):
         if self.audio_engine.song is None or self.audio_engine.audio_data is None:
             return
@@ -630,6 +605,7 @@ class RealtimeEqualizer(ctk.CTk):
         self.time_label.configure(
             text=f"{_format_duration(current_seconds)} / {_format_duration(total_seconds)}"
         )
+        # Sadece kullanıcı slider'ı sürüklemiyorsa slider'ı programatik olarak güncelle
         if not self.is_seeking_with_slider and len(self.audio_engine.audio_data) > 0:
             self.progress_bar.set(
                 (current_frame / len(self.audio_engine.audio_data)) * 1000
@@ -638,60 +614,44 @@ class RealtimeEqualizer(ctk.CTk):
     def update_visualization(self, samples: np.ndarray):
         if not self.audio_engine.is_playing or len(samples) < 1:
             return
-        
-        try:
-            magnitudes = 20 * np.log10(
-                np.abs(np.fft.rfft(samples * np.hanning(len(samples)))) + 1e-9
-            )
-            canvas_height = self.vis_canvas.winfo_height()
-            if canvas_height <= 1:
-                canvas_height = 120
-            num_fft_bins, log_indices = len(magnitudes), np.logspace(
-                0, np.log10(len(magnitudes) - 1), NUM_VIS_BARS + 1, dtype=int
-            )
+        magnitudes = 20 * np.log10(
+            np.abs(np.fft.rfft(samples * np.hanning(len(samples)))) + 1e-9
+        )
+        canvas_height = self.vis_canvas.winfo_height()
+        if canvas_height <= 1:
+            canvas_height = 180
+        num_fft_bins, log_indices = len(magnitudes), np.logspace(
+            0, np.log10(len(magnitudes) - 1), NUM_VIS_BARS + 1, dtype=int
+        )
 
-            for i in range(NUM_VIS_BARS):
-                try:
-                    start_idx, end_idx = log_indices[i], log_indices[i + 1]
-                    bar_magnitude = (
-                        np.mean(magnitudes[start_idx:end_idx])
-                        if start_idx < end_idx
-                        else (
-                            magnitudes[start_idx]
-                            if start_idx < num_fft_bins
-                            else VIS_MIN_DB - 10
-                        )
-                    )
-                    normalized_height = (bar_magnitude - VIS_MIN_DB) / VIS_DB_RANGE
-                    bar_height = min(max(normalized_height * canvas_height, 0), canvas_height)
-                    
-                    # Canvas koordinatlarını güvenli bir şekilde kontrol et
-                    if i < len(self.vis_bars):
-                        coords = self.vis_canvas.coords(self.vis_bars[i])
-                        if len(coords) >= 4:
-                            x0, _, x1, _ = coords
-                            self.vis_canvas.coords(
-                                self.vis_bars[i], x0, canvas_height - bar_height, x1, canvas_height
-                            )
-                        
-                        color = "#1f77b4"
-                        if bar_magnitude > -12.0:
-                            color = "#2ca02c"
-                        if bar_magnitude > -6.0:
-                            color = "#ff7f0e"
-                        if bar_magnitude > -3.0:
-                            color = "#d62728"
-                        if bar_magnitude > 0.0:
-                            color = "#8b0000"
-                        self.vis_canvas.itemconfigure(self.vis_bars[i], fill=color)
-                except Exception as bar_error:
-                    # Tek bir bar'da hata olursa diğerleri devam etsin
-                    continue
-                    
-        except Exception as e:
-            # Visualizer tamamen hata verirse sessizce geç
-            print(f"Visualization error: {e}")
-            return
+        for i in range(NUM_VIS_BARS):
+            start_idx, end_idx = log_indices[i], log_indices[i + 1]
+            bar_magnitude = (
+                np.mean(magnitudes[start_idx:end_idx])
+                if start_idx < end_idx
+                else (
+                    magnitudes[start_idx]
+                    if start_idx < num_fft_bins
+                    else VIS_MIN_DB - 10
+                )
+            )
+            normalized_height = (bar_magnitude - VIS_MIN_DB) / VIS_DB_RANGE
+            bar_height = min(max(normalized_height * canvas_height, 0), canvas_height)
+            if len(self.vis_canvas.coords(self.vis_bars[i])) >= 4:
+                x0, _, x1, _ = self.vis_canvas.coords(self.vis_bars[i])
+                self.vis_canvas.coords(
+                    self.vis_bars[i], x0, canvas_height - bar_height, x1, canvas_height
+                )
+            color = "#1f77b4"
+            if bar_magnitude > -12.0:
+                color = "#2ca02c"
+            if bar_magnitude > -6.0:
+                color = "#ff7f0e"
+            if bar_magnitude > -3.0:
+                color = "#d62728"
+            if bar_magnitude > 0.0:
+                color = "#8b0000"
+            self.vis_canvas.itemconfigure(self.vis_bars[i], fill=color)
 
     def on_playback_stopped(self):
         self.after(0, self._disable_playback_controls_if_needed)
@@ -714,21 +674,15 @@ class RealtimeEqualizer(ctk.CTk):
                 text="Wiedergabe beendet. Wählen Sie einen Song."
             )
 
+    # --- Diğer UI Fonksiyonları ---
     def populate_library_from_catalog(self, directory: Optional[str] = None):
         if directory is None:
-            music_directory = resource_path("music")
-            directory_to_scan = music_directory
-        else:
-            directory_to_scan = directory
-
+            directory_to_scan = resource_path("music")
         for widget in self.music_list_frame.winfo_children():
             widget.destroy()
-
         found_files = {
-            os.path.basename(p): p
-            for p in glob.glob(os.path.join(directory_to_scan, "*.mp3"))
+            os.path.basename(p): p for p in glob.glob(os.path.join(directory_to_scan, "*.mp3"))
         }
-
         matched_count = 0
         for entry in MUSIC_CATALOG:
             if entry["filename"] in found_files:
@@ -737,10 +691,8 @@ class RealtimeEqualizer(ctk.CTk):
             else:
                 entry["filepath"] = None
             self._create_library_entry_widget(entry)
-
-        display_name = os.path.basename(directory) if directory else "Dahili Kütüphane"
         self.music_list_frame.configure(
-            label_text=f"Müzik Kütüphanesi ({display_name})"
+            label_text=f"Müzik Kütüphanesi ({os.path.basename(directory_to_scan)})"
         )
         self.status_label.configure(
             text=f"{matched_count} / {len(MUSIC_CATALOG)} eser eşleştirildi."
@@ -765,7 +717,7 @@ class RealtimeEqualizer(ctk.CTk):
             font=ctk.CTkFont(size=12),
             anchor="w",
             justify=tk.LEFT,
-            wraplength=900,
+            wraplength=600,
         ).pack(fill="x", pady=(5, 0))
         button_frame = ctk.CTkFrame(entry_frame, fg_color="transparent")
         button_frame.grid(row=0, column=1, padx=10, pady=10)
@@ -787,8 +739,8 @@ class RealtimeEqualizer(ctk.CTk):
 
     def _draw_db_labels(self):
         self.db_label_canvas.delete("all")
-        canvas_height = 120
-        for db_val in range(12, -60, -12):
+        canvas_height = 180
+        for db_val in range(12, -60, -6):
             if db_val == 0:
                 continue
             y_pos = canvas_height - (
@@ -797,46 +749,47 @@ class RealtimeEqualizer(ctk.CTk):
             text = f"+{db_val}" if db_val > 0 else str(db_val)
             if 0 <= y_pos <= canvas_height:
                 self.db_label_canvas.create_text(
-                    20,
+                    25,
                     y_pos,
                     text=text,
                     fill="lightgray",
-                    font=("Arial", 8),
+                    font=("Arial", 9),
                     anchor="center",
                 )
         zero_db_y = canvas_height - (((0 - VIS_MIN_DB) / VIS_DB_RANGE) * canvas_height)
         self.db_label_canvas.create_line(
-            35, zero_db_y, 40, zero_db_y, fill="white", width=1
+            45, zero_db_y, 50, zero_db_y, fill="white", width=1
         )
         self.db_label_canvas.create_text(
-            20,
+            25,
             zero_db_y,
             text="0dB",
             fill="white",
-            font=("Arial", 8, "bold"),
+            font=("Arial", 9, "bold"),
             anchor="center",
         )
 
     def _update_visualizer_freq_labels(self):
+        """Görselleştiricinin altındaki frekans etiketlerini günceller."""
         self.label_canvas.delete("all")
         if not self.audio_engine.song:
             return
 
-        canvas_width = 1200 - 40 - 40 - 10
+        canvas_width = 850 - 40 - 50 - 10
         bar_width = canvas_width / NUM_VIS_BARS
         fft_freqs = np.fft.rfftfreq(CHUNK_SIZE, 1 / self.audio_engine.song.frame_rate)
         log_indices = np.logspace(
             0, np.log10(len(fft_freqs) - 1), NUM_VIS_BARS + 1, dtype=int
         )
 
-        for i in range(0, NUM_VIS_BARS, 5):
+        for i in range(0, NUM_VIS_BARS, 4):  # Her 4 çubukta bir etiket göster
             idx = log_indices[i]
             if idx < len(fft_freqs):
                 freq = fft_freqs[idx]
                 text = f"{freq/1000:.1f}k" if freq >= 1000 else f"{int(freq)}"
                 x_pos = (i + 0.5) * bar_width
                 self.label_canvas.create_text(
-                    x_pos, 10, text=text, fill="lightgray", font=("Arial", 8)
+                    x_pos, 12, text=text, fill="lightgray", font=("Arial", 9)
                 )
 
     def _update_song_info_panel(self, filepath: str):
@@ -856,22 +809,6 @@ class RealtimeEqualizer(ctk.CTk):
         self.title_label.configure(text=title)
         self.artist_label.configure(text=f"Künstler: {artist}")
         self.album_label.configure(text=f"Album: {album} ({year})")
-
-    def _reset_visualizer(self):
-        """Visualizer'ı sıfırla (seek sonrası donma problemini çözer)"""
-        try:
-            canvas_width = 1200 - 40 - 40 - 10
-            bar_width = canvas_width / NUM_VIS_BARS
-            
-            # Tüm bar'ları sıfırla
-            for i in range(NUM_VIS_BARS):
-                if i < len(self.vis_bars):
-                    x0 = i * bar_width
-                    x1 = (i + 1) * bar_width
-                    self.vis_canvas.coords(self.vis_bars[i], x0, 120, x1, 120)
-                    self.vis_canvas.itemconfigure(self.vis_bars[i], fill="#1f77b4")
-        except Exception as e:
-            print(f"Visualizer reset error: {e}")
 
     def on_closing(self):
         self.audio_engine.close()
